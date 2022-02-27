@@ -1,7 +1,9 @@
+use std::str::FromStr;
+
 use node_template_runtime::{
 	opaque::SessionKeys, AccountId, AuraConfig, Balance, BalancesConfig, GenesisConfig,
 	GrandpaConfig, MaxNominations, SessionConfig, Signature, StakingConfig, SudoConfig,
-	SystemConfig, DOLLARS, WASM_BINARY,
+	SystemConfig, WASM_BINARY,
 };
 use pallet_staking::StakerStatus;
 use rand::{distributions::Alphanumeric, rngs::OsRng, seq::SliceRandom, Rng};
@@ -11,8 +13,30 @@ use sp_core::{sr25519, Pair, Public};
 use sp_finality_grandpa::AuthorityId as GrandpaId;
 use sp_runtime::traits::{IdentifyAccount, Verify};
 
-// The URL for the telemetry server.
-// const STAGING_TELEMETRY_URL: &str = "wss://telemetry.polkadot.io/submit/";
+lazy_static::lazy_static! {
+	static ref NOMINATORS: u32 = std::env::var("N").unwrap().parse().unwrap();
+	static ref CANDIDATES: u32 = std::env::var("C").unwrap().parse().unwrap();
+	static ref VALIDATORS: u32 = std::env::var("V").unwrap().parse().unwrap();
+	static ref NOMINATION_DEGREE: NominationDegree = NominationDegree::from_str(std::env::var("ND").unwrap().as_ref()).unwrap();
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum NominationDegree {
+	Partial,
+	Full,
+}
+
+impl FromStr for NominationDegree {
+	type Err = ();
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		Ok(match &s[..] {
+			"partial" => Self::Partial,
+			"full" => Self::Full,
+			_ => panic!("wrong nomination-degree."),
+		})
+	}
+}
 
 /// Specialized `ChainSpec`. This is a specialization of the general Substrate ChainSpec type.
 pub type ChainSpec = sc_service::GenericChainSpec<GenesisConfig>;
@@ -46,29 +70,6 @@ pub fn authority_keys_from_seed(s: &str) -> (AccountId, AuraId, GrandpaId) {
 
 pub fn development_config() -> Result<ChainSpec, String> {
 	let wasm_binary = WASM_BINARY.ok_or_else(|| "Development wasm not available".to_string())?;
-	let rand_str =
-		|| -> String { OsRng.sample_iter(&Alphanumeric).take(32).map(char::from).collect() };
-
-	const N: usize = 1000;
-	const A: usize = 100;
-
-	println!("generating {} nominators and {} authorities.", N, A);
-
-	let nominators = (0..N)
-		.map(|_| rand_str())
-		.map(|seed| get_account_id_from_seed::<sr25519::Public>(seed.as_str()))
-		.collect::<Vec<_>>();
-
-	let authorities = vec![authority_keys_from_seed("Alice")]
-		.into_iter()
-		.chain(
-			(N..N + A)
-				.map(|_| rand_str())
-				.map(|seed| authority_keys_from_seed(seed.as_str())),
-		)
-		.collect::<Vec<_>>();
-
-	let sudo = authorities.first().map(|x| x.0.clone()).unwrap();
 
 	Ok(ChainSpec::from_genesis(
 		// Name
@@ -76,15 +77,7 @@ pub fn development_config() -> Result<ChainSpec, String> {
 		// ID
 		"dev",
 		ChainType::Development,
-		move || {
-			testnet_genesis(
-				wasm_binary,
-				authorities.clone(),
-				nominators.clone(),
-				sudo.clone(),
-				true,
-			)
-		},
+		move || testnet_genesis(wasm_binary, true),
 		vec![],
 		None,
 		None,
@@ -98,23 +91,50 @@ fn session_keys(aura: AuraId, grandpa: GrandpaId) -> SessionKeys {
 	SessionKeys { grandpa, aura }
 }
 
-enum NominationDegree {
-	Partial,
-	Full,
-}
-
 /// Configure initial storage state for FRAME modules.
-fn testnet_genesis(
-	wasm_binary: &[u8],
-	initial_authorities: Vec<(AccountId, AuraId, GrandpaId)>,
-	initial_nominators: Vec<AccountId>,
-	root_key: AccountId,
-	_enable_println: bool,
-) -> GenesisConfig {
-	const ENDOWMENT: Balance = 10_000_000 * DOLLARS;
-	const STASH_MIN: Balance = ENDOWMENT / 1000;
-	const STASH_MAX: Balance = ENDOWMENT / 10;
-	const ND: NominationDegree = NominationDegree::Full;
+fn testnet_genesis(wasm_binary: &[u8], _enable_println: bool) -> GenesisConfig {
+	let rand_str =
+		|| -> String { OsRng.sample_iter(&Alphanumeric).take(32).map(char::from).collect() };
+
+	let nominators: u32 = *NOMINATORS;
+	let validators: u32 = *VALIDATORS;
+	let candidates: u32 = *CANDIDATES;
+	let nomination_degree: NominationDegree = *NOMINATION_DEGREE;
+
+	let min_balance = node_template_runtime::voter_bags::EXISTENTIAL_WEIGHT as Balance;
+	let stash_min: Balance = min_balance;
+	let stash_max: Balance = **node_template_runtime::voter_bags::THRESHOLDS
+		.iter()
+		.skip(100)
+		.take(1)
+		.collect::<Vec<_>>()
+		.first()
+		.unwrap() as u128;
+	let endowment: Balance = stash_max * 2;
+
+	println!(
+		"nominators {:?} / validators {:?} / candidates {:?} / maxNomination {}.",
+		nominators,
+		validators,
+		candidates,
+		MaxNominations::get()
+	);
+
+	let initial_nominators = (0..nominators)
+		.map(|_| rand_str())
+		.map(|seed| get_account_id_from_seed::<sr25519::Public>(seed.as_str()))
+		.collect::<Vec<_>>();
+
+	let initial_authorities = vec![authority_keys_from_seed("Alice")]
+		.into_iter()
+		.chain(
+			(nominators..nominators + candidates)
+				.map(|_| rand_str())
+				.map(|seed| authority_keys_from_seed(seed.as_str())),
+		)
+		.collect::<Vec<_>>();
+
+	let root_key = authority_keys_from_seed("Alice").0;
 
 	let endowed_accounts = initial_authorities
 		.iter()
@@ -122,27 +142,35 @@ fn testnet_genesis(
 		.chain(initial_nominators.iter().cloned())
 		.collect::<Vec<_>>();
 
-	let mut rng = rand::thread_rng();
+	let rng1 = rand::thread_rng();
+	let mut rng2 = rand::thread_rng();
 	let stakers = initial_authorities
 		.iter()
-		.map(|x| (x.0.clone(), x.0.clone(), STASH_MAX, StakerStatus::Validator))
+		.map(|x| {
+			(
+				x.0.clone(),
+				x.0.clone(),
+				rng1.clone().gen_range(stash_min..=stash_max),
+				StakerStatus::Validator,
+			)
+		})
 		.chain(initial_nominators.iter().map(|x| {
 			let limit = (MaxNominations::get() as usize).min(initial_authorities.len());
-			let count = match ND {
-				NominationDegree::Full => (rng.gen::<usize>() % limit).max(1),
+			let count = match nomination_degree {
+				NominationDegree::Full => (rng2.gen::<usize>() % limit).max(1),
 				NominationDegree::Partial => limit,
 			};
 
 			let nominations = initial_authorities
 				.as_slice()
-				.choose_multiple(&mut rng, count)
+				.choose_multiple(&mut rng2, count)
 				.into_iter()
 				.map(|choice| choice.0.clone())
 				.collect::<Vec<_>>();
 			(
 				x.clone(),
 				x.clone(),
-				rng.gen_range(STASH_MIN..=STASH_MAX),
+				rng2.gen_range(stash_min..=stash_max),
 				StakerStatus::Nominator(nominations),
 			)
 		}))
@@ -151,7 +179,7 @@ fn testnet_genesis(
 	GenesisConfig {
 		system: SystemConfig { code: wasm_binary.to_vec() },
 		balances: BalancesConfig {
-			balances: endowed_accounts.iter().cloned().map(|k| (k, ENDOWMENT)).collect(),
+			balances: endowed_accounts.iter().cloned().map(|k| (k, endowment)).collect(),
 		},
 		session: SessionConfig {
 			keys: initial_authorities
@@ -161,8 +189,8 @@ fn testnet_genesis(
 		},
 		staking: StakingConfig {
 			stakers,
-			validator_count: initial_authorities.len() as u32,
-			minimum_validator_count: (initial_authorities.len() / 2) as u32,
+			validator_count: validators,
+			minimum_validator_count: validators / 2,
 			..Default::default()
 		},
 		aura: AuraConfig { authorities: vec![] },
